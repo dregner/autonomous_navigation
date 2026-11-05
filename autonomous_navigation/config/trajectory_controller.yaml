@@ -7,26 +7,30 @@
     accept_radius: 0.3           # [m] waypoint acceptance radius
     odom_timeout: 0.5            # [s] send neutral sticks if odometry is older than this
     hold_final_position: true    # keep regulating on the last waypoint instead of going neutral
-    yaw_mode: 0                  # 0 = hold initial yaw, 1 = look at the duct/path centre, 2 = yaw_fixed
+    yaw_mode: 0                  # 0 = hold initial yaw, 1 = look at configured duct, 2 = yaw_fixed
+    max_horizontal_speed: 0.30   # [m/s] planar PD velocity reference limit, 0 disables
     yaw_fixed: 0.0               # [rad] used when yaw_mode == 2
     twist_in_body_frame: true    # MAVROS local_position/odom publishes the twist in base_link
-
+    use_sim_time: true                 # use /clock from Gazebo simulation
     # Efforts are normalized: 1.0 == full stick. out_max limits the authority per axis,
     # i_max limits the integral *contribution* to the effort.
     pid:
-      forward: {kp: 0.8, ki: 0.10, kd: 0.30, i_max: 0.30, out_max: 0.60}
-      lateral: {kp: 1.0, ki: 0.10, kd: 0.30, i_max: 0.30, out_max: 0.60}
+      forward: {kp: 0.55, ki: 0.0, kd: 0.45, i_max: 0.30, out_max: 0.60}
+      lateral: {kp: 0.55, ki: 0.0, kd: 0.45, i_max: 0.30, out_max: 0.60}
       # ALT_HOLD: throttle stick == climb-rate set-point, ArduSub already closes the depth loop
       depth:   {kp: 1.0, ki: 0.05, kd: 0.00, i_max: 0.20, out_max: 0.60}
       # ALT_HOLD: yaw stick == yaw-rate set-point, ArduSub already damps the yaw rate
       yaw:     {kp: 0.3, ki: 0.00, kd: 0.00, i_max: 0.10, out_max: 0.40}
 
     # RC mapping. pwm = 1500 +/- (deadzone + |effort| * (max_pwm_delta - deadzone))
-    # Dead-zones must match the ArduSub parameters RC5_DZ / RC6_DZ / RC4_DZ / THR_DZ.
+    # ArduSub reads forward/lateral with norm_input() (NO dead-zone, confirmed by the identification bag:
+    # a 1510 us stick already accelerates the vehicle). Yaw (RC4_DZ=40) and throttle (THR_DZ=100) dead-zones
+    # apply only to the rate set-points in ALT_HOLD; set them to 0 if you fly MANUAL or changed the params.
     effort_eps: 0.02             # |effort| below this -> exactly 1500 (let ArduSub hold depth/heading)
+    yaw_effort_eps: 0.005        # yaw effort below this -> neutral
     max_pwm_delta: 400           # 400 == full 1100..1900 range; lower it for a gentle first test (e.g. 250)
     deadzone:
-      forward: 30
-      lateral: 30
+      forward: 0
+      lateral: 0
       yaw: 40
       throttle: 100

@@ -129,6 +129,17 @@ inline void worldToBody(double yaw, double ex, double ey, double & e_fwd, double
     e_lat = -s * ex + c * ey;
 }
 
+/// Scale planar position errors so the PD velocity reference stays within max_speed.
+inline double horizontalSpeedScale(
+    double forward_error, double lateral_error, const PidGains & forward,
+    const PidGains & lateral, double max_speed)
+{
+    if (max_speed <= 0.0 || forward.kd <= 0.0 || lateral.kd <= 0.0) return 1.0;
+    const double speed = std::hypot(forward.kp * forward_error / forward.kd,
+                                    lateral.kp * lateral_error / lateral.kd);
+    return speed > max_speed ? max_speed / speed : 1.0;
+}
+
 /// Map a normalized effort in [-1, 1] to an RC PWM value, compensating the
 /// autopilot's RC dead-zone so that even tiny efforts produce some thrust
 /// (ArduSub ignores |pwm - 1500| < RCx_DZ; in ALT_HOLD the throttle dead-zone

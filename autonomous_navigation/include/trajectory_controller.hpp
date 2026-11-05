@@ -77,7 +77,7 @@ private:
     void loadControllerParams();
     void resetControllers();
     tf2::Quaternion lookAtTheDuct(const geometry_msgs::msg::Point & robot_position);
-    double desiredYaw(const geometry_msgs::msg::Point & robot_position) const;
+    double desiredYaw(const geometry_msgs::msg::Point & robot_position, double yaw) const;
 
     // ----------------------------------------------------------- ROS handles
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
@@ -147,6 +147,8 @@ private:
     double accept_radius_{0.3};
     double odom_timeout_{0.5};
     double effort_eps_{0.02};
+    double yaw_effort_eps_{0.005};
+    double max_horizontal_speed_{0.0};
     int max_pwm_delta_{400};
     int dz_forward_{30};
     int dz_lateral_{30};

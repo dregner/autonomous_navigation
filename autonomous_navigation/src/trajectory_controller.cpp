@@ -63,10 +63,6 @@ TrajectoryController::TrajectoryController() : Node("trajectory_controller")
     this->declare_parameter<int>("points", 50);
     this->declare_parameter<int>("path_type", 0);
 
-    this->declare_parameter<double>("duct_x", 3.0);
-    this->declare_parameter<double>("duct_y", 1.5);
-    this->declare_parameter<double>("duct_z", -1.0);
-
     // PID gains. Efforts are normalized: 1.0 == full stick. Starting points were
     // derived from the previous hard-coded gains (old_gain * 120 / 370).
     declareGains(*this, "forward", {0.8, 0.10, 0.30, 0.30, 0.60});
@@ -78,10 +74,12 @@ TrajectoryController::TrajectoryController() : Node("trajectory_controller")
     this->declare_parameter<double>("accept_radius", 0.3);
     this->declare_parameter<double>("odom_timeout", 0.5);
     this->declare_parameter<double>("effort_eps", 0.02);
+    this->declare_parameter<double>("yaw_effort_eps", 0.005);
+    this->declare_parameter<double>("max_horizontal_speed", 0.0);
     this->declare_parameter<int>("max_pwm_delta", 400);
-    // ArduSub defaults: RC5_DZ/RC6_DZ = 30, RC4_DZ = 40, THR_DZ = 100 (ALT_HOLD climb rate)
-    this->declare_parameter<int>("deadzone.forward", 30);
-    this->declare_parameter<int>("deadzone.lateral", 30);
+    // ArduSub: forward/lateral use norm_input() (no dead-zone); RC4_DZ = 40 and THR_DZ = 100 apply in ALT_HOLD
+    this->declare_parameter<int>("deadzone.forward", 0);
+    this->declare_parameter<int>("deadzone.lateral", 0);
     this->declare_parameter<int>("deadzone.yaw", 40);
     this->declare_parameter<int>("deadzone.throttle", 100);
     this->declare_parameter<bool>("twist_in_body_frame", true);
@@ -94,9 +92,6 @@ TrajectoryController::TrajectoryController() : Node("trajectory_controller")
     this->declare_parameter<std::string>("log_dir", "/home/jetson/Documents/logs_auv");
 
     this->get_parameter("frame_id", frame_id_);
-    this->get_parameter("duct_x", duct_position_.pdx);
-    this->get_parameter("duct_y", duct_position_.pdy);
-    this->get_parameter("duct_z", duct_position_.pdz);
     loadControllerParams();
 
     debug_mode_ = this->get_parameter("debug_mode").as_bool();
@@ -160,7 +155,8 @@ TrajectoryController::TrajectoryController() : Node("trajectory_controller")
     // ---------------------------------------------------------- control loop
     const double rate = std::max(1.0, this->get_parameter("control_rate_hz").as_double());
     const auto period = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::duration<double>(1.0 / rate));
-    timer_ = this->create_wall_timer(period, std::bind(&TrajectoryController::pathFollower, this), cb_group_timer_);
+    // ROS-clock timer (not wall clock): with `use_sim_time:=true` the control period and the PID dt follow the
+    timer_ = rclcpp::create_timer(this, this->get_clock(), period, std::bind(&TrajectoryController::pathFollower, this), cb_group_timer_);
 
     // Live re-tuning: `ros2 param set /navigation/trajectory_controller pid.forward.kp 1.2`
     param_cb_handle_ = this->add_on_set_parameters_callback(
@@ -199,6 +195,8 @@ void TrajectoryController::loadControllerParams()
     accept_radius_ = this->get_parameter("accept_radius").as_double();
     odom_timeout_ = this->get_parameter("odom_timeout").as_double();
     effort_eps_ = this->get_parameter("effort_eps").as_double();
+    yaw_effort_eps_ = this->get_parameter("yaw_effort_eps").as_double();
+    max_horizontal_speed_ = this->get_parameter("max_horizontal_speed").as_double();
     max_pwm_delta_ = this->get_parameter("max_pwm_delta").as_int();
     dz_forward_ = this->get_parameter("deadzone.forward").as_int();
     dz_lateral_ = this->get_parameter("deadzone.lateral").as_int();
@@ -235,6 +233,15 @@ rcl_interfaces::msg::SetParametersResult TrajectoryController::on_parameters_set
             result.successful = false;
             result.reason = n + " must be >= 0";
             return result;
+        }
+        if (n == "max_horizontal_speed" || n == "yaw_effort_eps") {
+            const double value = p.get_type() == rclcpp::ParameterType::PARAMETER_DOUBLE ?
+                p.as_double() : -1.0;
+            if (!std::isfinite(value) || value < 0.0 || (n == "yaw_effort_eps" && value == 0.0)) {
+                result.successful = false;
+                result.reason = n + " must be a finite double in the allowed range";
+                return result;
+            }
         }
         if (n == "yaw_mode" && (p.as_int() < 0 || p.as_int() > 2)) {
             result.successful = false;
@@ -405,7 +412,7 @@ void TrajectoryController::publish_rc(double forward, double lateral, double dep
     //   throttle:1900 = up                 (same sign)
     rc_msg.channels[5 - 1] = nav_ctrl::effortToPwm(forward, false, dz_forward_, max_pwm_delta_, effort_eps_);
     rc_msg.channels[6 - 1] = nav_ctrl::effortToPwm(lateral, true, dz_lateral_, max_pwm_delta_, effort_eps_);
-    rc_msg.channels[4 - 1] = nav_ctrl::effortToPwm(yaw, true, dz_yaw_, max_pwm_delta_, effort_eps_);
+    rc_msg.channels[4 - 1] = nav_ctrl::effortToPwm(yaw, true, dz_yaw_, max_pwm_delta_, yaw_effort_eps_);
     rc_msg.channels[3 - 1] = nav_ctrl::effortToPwm(depth, false, dz_throttle_, max_pwm_delta_, effort_eps_);
 
     rc_pub_->publish(rc_msg);
@@ -502,7 +509,7 @@ void TrajectoryController::transformPath(const nav_msgs::msg::Path::ConstSharedP
                                      p.pose.position.z + origin_z_});
     }
 
-    if (!path_transformed_.empty()) {
+        if (!path_transformed_.empty() && yaw_mode_ == YawMode::LOOK_AT_DUCT) {
         double sum_x = 0.0, sum_y = 0.0, sum_z = 0.0;
         for (const auto & p : path_transformed_) {
             sum_x += p.x;
@@ -564,12 +571,14 @@ tf2::Quaternion TrajectoryController::lookAtTheDuct(const geometry_msgs::msg::Po
     return q_tf;
 }
 
-double TrajectoryController::desiredYaw(const geometry_msgs::msg::Point & robot_position) const
+double TrajectoryController::desiredYaw(const geometry_msgs::msg::Point & robot_position, double yaw) const
 {
     switch (yaw_mode_) {
-        case YawMode::LOOK_AT_DUCT:
-            // planar look-at is all we need for the yaw DOF
-            return std::atan2(duct_position_.pdy - robot_position.y, duct_position_.pdx - robot_position.x);
+        case YawMode::LOOK_AT_DUCT: {
+            const double dx = duct_position_.pdx - robot_position.x;
+            const double dy = duct_position_.pdy - robot_position.y;
+            return std::hypot(dx, dy) < 1e-6 ? yaw : std::atan2(dy, dx);
+        }
         case YawMode::FIXED:
             return yaw_fixed_;
         case YawMode::HOLD_INITIAL:
@@ -666,6 +675,7 @@ void TrajectoryController::pathFollower()
     geometry_msgs::msg::Pose pose;
     geometry_msgs::msg::Twist vel;
     waypoint target{};
+    double yaw = 0.0;
     double yaw_des = 0.0;
     bool last_wp = false;
     rclcpp::Time now = this->now();
@@ -698,7 +708,8 @@ void TrajectoryController::pathFollower()
         }
         last_wp = (trajectory_index_ + 1 >= path_transformed_.size());
         target = path_transformed_[trajectory_index_];
-        yaw_des = desiredYaw(pose.position);
+        yaw = tf2::getYaw(pose.orientation);
+        yaw_des = desiredYaw(pose.position, yaw);
 
         if (last_wp && dist_to(target) < accept_radius_) {
             if (!finished_) {
@@ -723,8 +734,6 @@ void TrajectoryController::pathFollower()
     last_time_ = now;
 
     // ----------------------------------------------------------- errors
-    const double yaw = tf2::getYaw(pose.orientation);
-
     const double ex = target.x - pose.position.x;
     const double ey = target.y - pose.position.y;
     const double ez = target.z - pose.position.z;
@@ -751,8 +760,10 @@ void TrajectoryController::pathFollower()
     const double yaw_rate = vel.angular.z;
 
     // -------------------------------------------------------------- PID
-    const double u_fwd = pid_fwd_.update(e_fwd, -v_fwd, dt);
-    const double u_lat = pid_lat_.update(e_lat, -v_lat, dt);
+    const double scale = nav_ctrl::horizontalSpeedScale(
+        e_fwd, e_lat, pid_fwd_.gains(), pid_lat_.gains(), max_horizontal_speed_);
+    const double u_fwd = pid_fwd_.update(scale * e_fwd, -v_fwd, dt);
+    const double u_lat = pid_lat_.update(scale * e_lat, -v_lat, dt);
     const double u_depth = pid_depth_.update(ez, -v_z, dt);
     const double u_yaw = pid_yaw_.update(e_yaw, -yaw_rate, dt);
 
